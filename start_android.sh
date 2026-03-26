@@ -1,47 +1,78 @@
 #!/bin/bash
 
 # --- КОНФИГУРАЦИЯ ---
-PORT="5555"
-MODEL_NAME="SM-S901N" # Модель вашего S22 из прошлого скриншота
-SUBNET="192.168.31.0/24" # Ваша подсеть
+MODEL="SM-S901N"
+CACHE_FILE="/tmp/s22_v3.cache"
+LOG_FILE="/tmp/scrcpy_s22.log"
+# Твой базовый IP для первичной проверки (ускоряет запуск)
+DEFAULT_IP="192.168.31.138"
 
-find_phone_ip() {
-    echo "[...] Ищу S22 в сети $SUBNET..."
-    # Ищем устройства с открытым портом 5555
-    local found_ip=$(nmap -p $PORT --open -n $SUBNET | grep "Nmap scan report for" | awk '{print $NF}')
-    
-    if [ -z "$found_ip" ]; then
-        return 1
+# Очистка при выходе (Ctrl+C)
+trap 'echo "[!] Выход..."; adb shell input keyevent 26 >/dev/null 2>&1; exit 0' SIGINT SIGTERM
+
+get_target() {
+    # 1. Проверка Кэша
+    if [ -f "$CACHE_FILE" ]; then
+        local cached=$(cat "$CACHE_FILE")
+        if timeout 1.5 adb connect "$cached" | grep -qE "connected|already"; then
+            echo "$cached" && return 0
+        fi
     fi
-    echo "$found_ip"
+
+    # 2. Быстрый поиск IP в ARP-таблице (без nmap по всей сети)
+    local target_ip=$(ip neigh show | grep -i "S22" | awk '{print $1}')
+    [ -z "$target_ip" ] && target_ip="$DEFAULT_IP"
+
+    # 3. Поиск активного порта только на целевом IP
+    echo "[...] Поиск порта на $target_ip..." >&2
+    local port=$(nmap -p 5555,30000-65535 --open "$target_ip" -n -oG - | grep -oP '\d+(?=/open/tcp)' | head -1)
+
+    if [ -n "$port" ]; then
+        local pair="$target_ip:$port"
+        if adb connect "$pair" | grep -q "connected"; then
+            echo "$pair" > "$CACHE_FILE"
+            echo "$pair"
+            return 0
+        fi
+    fi
+    return 1
 }
 
 while true; do
-    # 1. Поиск или проверка IP
-    CURRENT_IP=$(find_phone_ip)
+    DEVICE=$(get_target)
 
-    if [ -z "$CURRENT_IP" ]; then
-        echo "[!] Телефон не найден. Проверьте Wi-Fi и 'Отладку'. Повтор через 10с..."
+    if [ -z "$DEVICE" ]; then
+        echo "[!] S22 не найден. Включите 'Отладку по Wi-Fi'. Сон 10с..."
         sleep 10
         continue
     fi
 
-    echo "[✓] Телефон найден: $CURRENT_IP"
-    adb connect "$CURRENT_IP:$PORT" > /dev/null
+    echo "[✓] Сессия активна: $DEVICE"
+    > "$LOG_FILE"
 
-    # 2. Запуск трансляции
-    scrcpy --tcpip="$CURRENT_IP:$PORT" \
+    # Запуск с оптимизацией под Samsung S22
+    scrcpy --tcpip="$DEVICE" \
            --video-bit-rate=8M \
+           --always-on-top \
            --stay-awake \
            --power-off-on-close \
-           --window-title "Samsung S22 ($CURRENT_IP)"
+           --window-title "S22 Resilience" \
+           --verbosity=verbose 2> "$LOG_FILE"
 
-    # 3. Логика выхода (из прошлого ТЗ)
-    if adb -s "$CURRENT_IP:$PORT" shell getprop sys.boot_completed > /dev/null 2>&1; then
-        echo "[DONE] Сессия завершена пользователем."
+    EXIT_CODE=$?
+
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "[DONE] Штатное завершение."
+        adb -s "$DEVICE" shell input keyevent 26 >/dev/null 2>&1
         exit 0
+    fi
+
+    # Анализ сбоя энкодера (Lock/Unlock)
+    if grep -qiE "device disconnected|encoder error|connection reset" "$LOG_FILE"; then
+        echo "[RETRY] Сбой One UI энкодера. Переподключение через 3с..."
+        sleep 3
     else
-        echo "[RETRY] Связь потеряна. Ищу устройство заново..."
-        sleep 2
+        echo "[!] Ошибка (Код: $EXIT_CODE). Проверьте телефон. Жду 10с..."
+        sleep 10
     fi
 done
